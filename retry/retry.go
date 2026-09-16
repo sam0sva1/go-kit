@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -42,7 +43,12 @@ func WithAttempts(n int) Option { return func(c *config) { c.attempts = n } }
 func WithDelay(d time.Duration) Option { return func(c *config) { c.delay = d } }
 
 // WithBackoff умножает паузу на factor после каждой неудачи, не превышая max.
-// По умолчанию выключен: пауза постоянна.
+// Потолок ограничивает и первую паузу тоже, а не только выросшие.
+//
+// Значения factor вне области определения — NaN, бесконечности и меньше
+// единицы — трактуются как отсутствие роста. Сравнения с NaN всегда ложны,
+// поэтому наивная проверка factor < 1 его бы пропустила, а умножение дало бы
+// мусор. По умолчанию выключен: пауза постоянна.
 func WithBackoff(factor float64, max time.Duration) Option {
 	return func(c *config) {
 		c.factor = factor
@@ -85,6 +91,10 @@ func wait(ctx context.Context, d time.Duration) error {
 //
 // Паузы после последней попытки нет: повторять уже нечего.
 func Do(ctx context.Context, op Operation, opts ...Option) error {
+	if op == nil {
+		return errors.New("retry: операция не задана")
+	}
+
 	cfg := config{
 		attempts: 3,
 		delay:    100 * time.Millisecond,
@@ -98,12 +108,16 @@ func Do(ctx context.Context, op Operation, opts ...Option) error {
 	if cfg.attempts < 1 {
 		cfg.attempts = 1
 	}
-	if cfg.factor < 1 {
+	if math.IsNaN(cfg.factor) || math.IsInf(cfg.factor, 0) || cfg.factor < 1 {
 		cfg.factor = 1
 	}
 
 	var lastErr error
+
 	delay := cfg.delay
+	if cfg.maxDelay > 0 && delay > cfg.maxDelay {
+		delay = cfg.maxDelay
+	}
 
 	for attempt := 1; attempt <= cfg.attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -128,11 +142,25 @@ func Do(ctx context.Context, op Operation, opts ...Option) error {
 		}
 
 		if err := cfg.sleep(ctx, delay); err != nil {
-			return fmt.Errorf("retry: отменено после %d попыт(ки/ок): %w", attempt, errors.Join(lastErr, err))
+			// Сбой ожидания и отмена — разные вещи. Подменённый Sleeper может
+			// вернуть что угодно, и называть это отменой значит врать в сообщении.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("retry: отменено после %d попыт(ки/ок): %w", attempt, errors.Join(lastErr, ctxErr))
+			}
+
+			return fmt.Errorf("retry: ожидание после попытки %d не удалось: %w", attempt, errors.Join(lastErr, err))
 		}
 
 		if cfg.factor > 1 {
-			delay = time.Duration(float64(delay) * cfg.factor)
+			// Умножение в float64 может перескочить диапазон Duration и дать
+			// отрицательное значение, а отрицательная пауза означает повторы
+			// вообще без ожидания.
+			if next := float64(delay) * cfg.factor; next >= float64(math.MaxInt64) {
+				delay = math.MaxInt64
+			} else {
+				delay = time.Duration(next)
+			}
+
 			if cfg.maxDelay > 0 && delay > cfg.maxDelay {
 				delay = cfg.maxDelay
 			}

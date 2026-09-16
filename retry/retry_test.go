@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -34,6 +35,11 @@ func TestDo_DefaultsPreserveFixedDelaySemantics(t *testing.T) {
 	}
 	if !errors.Is(err, errBoom) {
 		t.Errorf("последняя ошибка потеряна: %v", err)
+	}
+	// Длина обязательна: без неё цикл ниже не выполнится ни разу на пустом
+	// срезе, и тест пройдёт, ничего не проверив.
+	if len(r.waits) != 4 {
+		t.Fatalf("пауз = %d, ожидалось 4 (между пятью попытками)", len(r.waits))
 	}
 	for i, w := range r.waits {
 		if w != 5*time.Second {
@@ -117,6 +123,9 @@ func TestDo_BackoffIsOptInAndGrows(t *testing.T) {
 	var off recorder
 	_ = Do(context.Background(), func(context.Context) error { return errBoom },
 		WithAttempts(4), WithDelay(time.Second), WithSleeper(off.sleep))
+	if len(off.waits) != 3 {
+		t.Fatalf("без WithBackoff пауз = %d, ожидалось 3", len(off.waits))
+	}
 	for i, w := range off.waits {
 		if w != time.Second {
 			t.Fatalf("без WithBackoff пауза %d = %v, ожидалось постоянное 1s", i, w)
@@ -126,6 +135,9 @@ func TestDo_BackoffIsOptInAndGrows(t *testing.T) {
 	var on recorder
 	_ = Do(context.Background(), func(context.Context) error { return errBoom },
 		WithAttempts(4), WithDelay(time.Second), WithBackoff(2, time.Minute), WithSleeper(on.sleep))
+	if len(on.waits) != 3 {
+		t.Fatalf("с WithBackoff пауз = %d, ожидалось 3", len(on.waits))
+	}
 	for i := 1; i < len(on.waits); i++ {
 		if on.waits[i] <= on.waits[i-1] {
 			t.Fatalf("с WithBackoff паузы не растут: %v", on.waits)
@@ -138,6 +150,9 @@ func TestDo_BackoffRespectsCeiling(t *testing.T) {
 	_ = Do(context.Background(), func(context.Context) error { return errBoom },
 		WithAttempts(8), WithDelay(time.Second), WithBackoff(10, 3*time.Second), WithSleeper(r.sleep))
 
+	if len(r.waits) != 7 {
+		t.Fatalf("пауз = %d, ожидалось 7", len(r.waits))
+	}
 	for i, w := range r.waits {
 		if w > 3*time.Second {
 			t.Errorf("пауза %d = %v превышает потолок 3s", i, w)
@@ -202,5 +217,104 @@ func TestDo_PassesContextToOperation(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("неожиданная ошибка: %v", err)
+	}
+}
+
+// Значения по умолчанию должны быть зафиксированы тестом: без него рефакторинг
+// поменяет их молча. Прежний тест с таким намерением передавал опции явно и
+// дефолты не проверял вовсе.
+func TestDo_UsesDocumentedDefaults(t *testing.T) {
+	var r recorder
+	calls := 0
+
+	_ = Do(context.Background(), func(context.Context) error {
+		calls++
+		return errBoom
+	}, WithSleeper(r.sleep))
+
+	if calls != 3 {
+		t.Errorf("по умолчанию попыток = %d, ожидалось 3", calls)
+	}
+	if len(r.waits) != 2 {
+		t.Fatalf("по умолчанию пауз = %d, ожидалось 2", len(r.waits))
+	}
+	for i, w := range r.waits {
+		if w != 100*time.Millisecond {
+			t.Errorf("пауза %d = %v, по умолчанию ожидалось 100ms", i, w)
+		}
+	}
+}
+
+// factor вне области определения не должен превращать паузы в мусор:
+// сравнения с NaN всегда ложны, а переполнение Duration даёт отрицательное
+// значение, то есть повторы без пауз вообще.
+func TestDo_RejectsDegenerateBackoffFactors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		factor float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"огромный", 1e300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var r recorder
+			_ = Do(context.Background(), func(context.Context) error { return errBoom },
+				WithAttempts(4), WithDelay(time.Second), WithBackoff(tc.factor, time.Minute),
+				WithSleeper(r.sleep))
+
+			if len(r.waits) != 3 {
+				t.Fatalf("пауз = %d, ожидалось 3", len(r.waits))
+			}
+			for i, w := range r.waits {
+				if w <= 0 || w > time.Minute {
+					t.Errorf("пауза %d = %v: вне допустимого диапазона (0, 1m]", i, w)
+				}
+			}
+		})
+	}
+}
+
+// Потолок обязан ограничивать и ПЕРВУЮ паузу, иначе документация про
+// "не превышая max" неверна ровно в самом типичном случае.
+func TestDo_CeilingAppliesToInitialDelay(t *testing.T) {
+	var r recorder
+	_ = Do(context.Background(), func(context.Context) error { return errBoom },
+		WithAttempts(3), WithDelay(10*time.Second), WithBackoff(2, 3*time.Second),
+		WithSleeper(r.sleep))
+
+	if len(r.waits) != 2 {
+		t.Fatalf("пауз = %d, ожидалось 2", len(r.waits))
+	}
+	for i, w := range r.waits {
+		if w > 3*time.Second {
+			t.Errorf("пауза %d = %v превышает потолок 3s", i, w)
+		}
+	}
+}
+
+// Публичный пакет не должен падать на nil-операции.
+func TestDo_RejectsNilOperation(t *testing.T) {
+	err := Do(context.Background(), nil)
+	if err == nil {
+		t.Fatal("для nil-операции ожидалась ошибка, получен nil")
+	}
+}
+
+// Ошибка ожидания не всегда означает отмену: подменённый Sleeper может вернуть
+// что угодно, и называть это отменой — врать в сообщении.
+func TestDo_DistinguishesSleeperFailureFromCancellation(t *testing.T) {
+	sleepFail := errors.New("часы сломались")
+
+	err := Do(context.Background(), func(context.Context) error { return errBoom },
+		WithAttempts(3),
+		WithSleeper(func(context.Context, time.Duration) error { return sleepFail }))
+
+	if !errors.Is(err, sleepFail) {
+		t.Errorf("ошибка ожидания потеряна: %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("сбой ожидания ошибочно представлен как отмена: %v", err)
 	}
 }

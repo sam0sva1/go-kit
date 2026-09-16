@@ -38,6 +38,13 @@ What it fixes relative to the copies it replaces:
   When a wait is cut short by cancellation, the cancellation cause is
   wrapped in alongside it.
 
+Guards, because this is a published package: a nil operation returns an error
+instead of panicking; a backoff factor that is NaN, infinite or below one is
+treated as no growth rather than producing nonsense delays; growth is checked
+for Duration overflow; and the ceiling applies to the first delay, not only to
+grown ones. A failure of the injected sleeper is reported as a wait failure, not
+mislabelled as a cancellation.
+
 Backoff is deliberately opt-in: one of the adopting call sites retries with
 a zero delay, and a default backoff would have changed its behaviour without
 anyone noticing.
